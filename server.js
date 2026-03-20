@@ -255,32 +255,38 @@ app.get('/api/transactions/:apiKey', async (req, res) => {
 
 // ==================== START SERVER ====================
 
+let isInitialized = false;
+
+const initializeApp = async (req, res, next) => {
+  if (!isInitialized) {
+    try {
+      // Connect to MongoDB if not already connected
+      if (mongoose.connection.readyState !== 1) {
+        await mongoose.connect(process.env.MONGODB_URI);
+        console.log('✅ MongoDB connected');
+      }
+      
+      // Initialize your custom txListener
+      await txListener.initialize();
+      
+      isInitialized = true;
+      next();
+    } catch (error) {
+      console.error('Initialization Error:', error);
+      res.status(500).send('Server Initialization Failed');
+    }
+  } else {
+    next();
+  }
+};
+app.use(initializeApp);
 const PORT = process.env.PORT || 3005;
 
-connectDB().then(async () => {
-  // Initialize the transaction listener
-  await txListener.initialize();
-  
+if (process.env.NODE_ENV !== 'production') {
+  const PORT = process.env.PORT || 3005;
   app.listen(PORT, () => {
-    console.log('\n=================================');
-    console.log(`🚀 Server 2 running on port ${PORT}`);
-    console.log('=================================');
-    console.log('\n📡 WEBHOOK ENDPOINTS:');
-    console.log(`   Alchemy: http://localhost:${PORT}/api/alchemy-webhook`);
-    console.log(`   Tatum:   http://localhost:${PORT}/api/tatum-webhook`);
-    console.log('\n🔐 SERVER 1 ENDPOINT (requires X-Access-Token):');
-    console.log(`   POST http://localhost:${PORT}/api/register-transaction`);
-    console.log('\n👤 DASHBOARD ENDPOINT:');
-    console.log(`   GET http://localhost:${PORT}/api/transactions/:apiKey`);
-    console.log('\n✅ HEALTH CHECK:');
-    console.log(`   GET http://localhost:${PORT}/health`);
-    
-    // Generate example token for Server 1 testing
-    const exampleToken = TokenManager.generateToken();
-    console.log('\n📋 Example X-Access-Token for Server 1 (valid 5 min):');
-    console.log(exampleToken);
-    console.log('\n=================================\n');
+    console.log(`🚀 Local Server running on port ${PORT}`);
   });
-});
+}
 
 module.exports = app;
