@@ -2,8 +2,9 @@
 const mongoose = require('mongoose');
 const { Schema } = mongoose;
 
+
 const TransactionSchema = new Schema({
-  hash: { type: String, required: true, unique: true, sparse: true },
+  hash: { type: String, required: true },
   amount: { type: Number, required: true },
   displayAmount: { type: String }, // Formatted amount for display
   currency: { type: String, required: true, default: 'ETH' },
@@ -21,7 +22,7 @@ const TransactionSchema = new Schema({
 
 // New schema for tracking pending transactions
 const TrackingSchema = new Schema({
-  trackingId: { type: String, required: true, unique: true },
+  trackingId: { type: String, required: true },
   recipientAddress: { type: String, required: true },
   amount: { type: Number, required: true },
   blockchain: { type: String, required: true }, // Source chain
@@ -44,8 +45,8 @@ const FeeRecipientSchema = new Schema({
 }, { _id: false });
 
 const BusinessProfileSchema = new Schema({
-  businessName: { type: String, required: true },
-  businessAddress: { type: String, required: true },
+  businessName: { type: String },
+  businessAddress: { type: String },
   businessPhone: { type: String },
   businessWebsite: { type: String },
   taxId: { type: String },
@@ -55,7 +56,7 @@ const BusinessProfileSchema = new Schema({
 }, { _id: false });
 
 const IntegrationSchema = new Schema({
-  apiKey: { type: String, required: true, unique: true },
+  apiKey: { type: String, required: true },
   name: { type: String, required: true },
   feeRecipients: { type: FeeRecipientSchema, required: true },
   feeBPS: { type: Number, required: true, min: 0, max: 10000 },
@@ -99,6 +100,14 @@ const UserSchema = new Schema(
       type: Date,
       select: false,
     },
+    passwordResetToken: {
+      type: String,
+      select: false,
+    },
+    passwordResetExpires: {
+      type: Date,
+      select: false,
+    },
     businessProfile: { type: BusinessProfileSchema },
     integrations: [IntegrationSchema],
   },
@@ -108,11 +117,27 @@ const UserSchema = new Schema(
 );
 
 // Indexes for faster queries
-UserSchema.index({ email: 1 });
-UserSchema.index({ username: 1 });
-UserSchema.index({ 'integrations.apiKey': 1 });
-UserSchema.index({ 'integrations.pendingTrackings.trackingId': 1 });
+UserSchema.index(
+  { 'integrations.apiKey': 1 },
+  {
+    unique: true,
+    partialFilterExpression: { 'integrations.apiKey': { $exists: true, $type: 'string' } },
+  }
+);
+UserSchema.index(
+  { 'integrations.pendingTrackings.trackingId': 1 },
+  {
+    unique: true,
+    partialFilterExpression: { 'integrations.pendingTrackings.trackingId': { $exists: true, $type: 'string' } },
+  }
+);
+UserSchema.index(
+  { 'integrations.txHashes.hash': 1 },
+  {
+    unique: true,
+    partialFilterExpression: { 'integrations.txHashes.hash': { $exists: true, $type: 'string' } },
+  }
+);
 UserSchema.index({ 'integrations.pendingTrackings.status': 1 });
-UserSchema.index({ 'integrations.txHashes.hash': 1 });
 
 module.exports = mongoose.models.User || mongoose.model('User', UserSchema);

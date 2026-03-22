@@ -11,8 +11,12 @@ const txListener = require('./script.js');
 
 dotenv.config();
 
+
 // Initialize express
 const app = express();
+
+// Enable trust proxy for correct client IP detection behind proxies
+app.set('trust proxy', true);
 
 // Middleware to capture raw body for webhook verification
 app.use(express.json({
