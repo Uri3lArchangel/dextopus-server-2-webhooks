@@ -498,7 +498,7 @@ async function createAlchemyWebhook(chain, address) {
 
   try {
     const webhookUrl = `${CONFIG.SERVER2_URL}/api/alchemy-webhook`;
-    
+    console.log({webhookUrl});
     if (!isValidWebhookUrl(webhookUrl)) {
       console.error(`❌ Invalid webhook URL: ${webhookUrl}`);
       return;
