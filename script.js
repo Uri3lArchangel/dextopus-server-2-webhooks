@@ -497,7 +497,10 @@ async function createAlchemyWebhook(chain, address) {
   }
 
   try {
-    const webhookUrl = `${CONFIG.SERVER2_URL}/api/alchemy-webhook`;
+    // Ensure no double slash in webhook URL
+    let baseUrl = CONFIG.SERVER2_URL;
+    if (baseUrl.endsWith('/')) baseUrl = baseUrl.slice(0, -1);
+    const webhookUrl = `${baseUrl}/api/alchemy-webhook`;
     console.log({webhookUrl});
     if (!isValidWebhookUrl(webhookUrl)) {
       console.error(`❌ Invalid webhook URL: ${webhookUrl}`);
@@ -1215,6 +1218,14 @@ module.exports = {
   initialize: async () => {
     await connectDB();
     await enableTatumHmac();
+    // Log ALCHEMY_AUTH_TOKEN for debugging (mask all but last 4 chars)
+    const token = CONFIG.ALCHEMY_AUTH_TOKEN;
+    if (token) {
+      const masked = token.length > 8 ? token.slice(0, 4) + '...' + token.slice(-4) : token;
+      console.log(`🔑 ALCHEMY_AUTH_TOKEN loaded: ${masked}`);
+    } else {
+      console.warn('⚠️  ALCHEMY_AUTH_TOKEN is NOT set!');
+    }
     console.log(`🚀 Server 2 monitor initialized`);
     console.log(`📊 Token list loaded with ${TOKENS.length} tokens`);
     console.log(`📊 Memory caches ready`);
