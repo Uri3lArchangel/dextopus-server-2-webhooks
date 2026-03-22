@@ -77,7 +77,7 @@ class TokenManager {
       const parts = token.split(':');
       if (parts.length !== 3) return false;
 
-      const [timestamp, nonce, signature] = parts;
+      const [timestamp, nonce, signature] = parts; 
       
       // Check expiration
       const tokenTime = parseInt(timestamp);
@@ -150,7 +150,7 @@ app.get('/health', (req, res) => {
 app.post("/api/register-transaction", authenticateServer1, async (req, res) => {
   try {
     const { apiKey, recipientAddress, amount, blockchain, vm } = req.body;
-
+      console.log({ALCHEMY_AUTH_TOKEN: process.env.ALCHEMY_AUTH_TOKEN});
     // Validate required fields
     if (!apiKey || !recipientAddress || !amount || !blockchain || !vm) {
       return res.status(400).json({ 
