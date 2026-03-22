@@ -15,8 +15,8 @@ dotenv.config();
 // Initialize express
 const app = express();
 
-// Enable trust proxy for correct client IP detection behind proxies
-app.set('trust proxy', true);
+// Enable trust proxy for correct client IP detection behind proxies (secure: trust only first proxy)
+app.set('trust proxy', 1);
 
 // Middleware to capture raw body for webhook verification
 app.use(express.json({
