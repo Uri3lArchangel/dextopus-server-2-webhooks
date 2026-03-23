@@ -139,5 +139,10 @@ UserSchema.index(
   }
 );
 UserSchema.index({ 'integrations.pendingTrackings.status': 1 });
+UserSchema.index({
+  'integrations.pendingTrackings.recipientAddress': 1,
+  'integrations.pendingTrackings.blockchain': 1,
+  'integrations.pendingTrackings.status': 1
+});
 
 module.exports = mongoose.models.User || mongoose.model('User', UserSchema);

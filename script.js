@@ -8,6 +8,8 @@ dotenv.config();
 
 // Import token list and constants
 const { TOKENS, NATIVE_TOKEN_ADDRESS } = require('./tokens.js');
+const WebhookKeyModel = require('./models/WebhookKey.js');
+const ProcessedHashModel = require('./models/ProcessedHash.js');
 
 // ==================== CHAIN EXPLORERS ====================
 const CHAIN_EXPLORERS = {
@@ -41,6 +43,12 @@ const CONFIG = {
   // Alchemy
   ALCHEMY_KEY: process.env.ALCHEMY_KEY,
   ALCHEMY_AUTH_TOKEN: process.env.ALCHEMY_AUTH_TOKEN,
+  ALCHEMY_RECONCILE_ENABLED: process.env.ALCHEMY_RECONCILE_ENABLED === 'true',
+  ALCHEMY_RECONCILE_INTERVAL_MS: Number(process.env.ALCHEMY_RECONCILE_INTERVAL_MS || 15 * 60 * 1000),
+  ALCHEMY_RECONCILE_LIMIT: Number(process.env.ALCHEMY_RECONCILE_LIMIT || 100),
+  PENDING_CLEANUP_ENABLED: process.env.PENDING_CLEANUP_ENABLED !== 'false',
+  PENDING_CLEANUP_INTERVAL_MS: Number(process.env.PENDING_CLEANUP_INTERVAL_MS || 10 * 60 * 1000),
+  PENDING_CLEANUP_LIMIT: Number(process.env.PENDING_CLEANUP_LIMIT || 500),
   
   // Tatum
   TATUM_API_KEY: process.env.TATUM_API_KEY,
@@ -264,7 +272,8 @@ const UserModel = require('./models/User.js');
 const processedHashes = new Set();
 const pendingTrackings = new Map();
 const addressToTrackings = new Map();
-const webhookMapping = new Map();
+const webhookByAddress = new Map();
+const webhookById = new Map();
 
 // Helper function to find token
 function findToken(chain, address, symbol) {
@@ -327,14 +336,52 @@ function verifyServer1Request(req) {
   );
 }
 
+function normalizeAlchemySignature(signatureHeader) {
+  if (!signatureHeader) return null;
+  const raw = Array.isArray(signatureHeader) ? signatureHeader[0] : signatureHeader;
+  const value = String(raw).trim();
+  if (!value) return null;
+  const match = value.match(/v1=([a-f0-9]+)/i);
+  if (match) return match[1];
+  if (value.includes(',')) {
+    return value.split(',')[0].trim();
+  }
+  return value;
+}
+
+async function loadWebhookKeysIntoMemory() {
+  await connectDB();
+  const keys = await WebhookKeyModel.find({}).lean();
+  for (const key of keys) {
+    if (key.address) {
+      webhookByAddress.set(key.address.toLowerCase(), {
+        webhookId: key.webhookId,
+        signingKey: key.signingKey,
+        chain: key.chain,
+        createdAt: key.createdAt
+      });
+    }
+    if (key.webhookId) {
+      webhookById.set(key.webhookId, {
+        address: key.address?.toLowerCase(),
+        signingKey: key.signingKey,
+        chain: key.chain,
+        createdAt: key.createdAt
+      });
+    }
+  }
+  console.log(`🔐 Loaded ${keys.length} webhook signing keys`);
+}
+
 async function verifyAlchemyWebhook(req) {
-  const signature = req.headers['x-alchemy-signature'];
+  const signature = normalizeAlchemySignature(req.headers['x-alchemy-signature']);
   if (!signature) {
     console.log('❌ No signature header found');
     return false;
   }
 
   try {
+    await connectDB();
     const payload = req.body;
     
     let address = null;
@@ -352,10 +399,29 @@ async function verifyAlchemyWebhook(req) {
       address = payload.toAddress;
     } else if (payload.webhookId) {
       webhookId = payload.webhookId;
-      for (const [addr, data] of webhookMapping.entries()) {
-        if (data.webhookId === payload.webhookId) {
-          address = addr;
-          break;
+    }
+    
+    if (!address && webhookId && webhookById.has(webhookId)) {
+      address = webhookById.get(webhookId).address;
+    }
+    
+    if (!address) {
+      if (webhookId) {
+        const keyById = await WebhookKeyModel.findOne({ webhookId }).lean();
+        if (keyById?.address) {
+          address = keyById.address.toLowerCase();
+          webhookByAddress.set(address, {
+            webhookId: keyById.webhookId,
+            signingKey: keyById.signingKey,
+            chain: keyById.chain,
+            createdAt: keyById.createdAt
+          });
+          webhookById.set(keyById.webhookId, {
+            address,
+            signingKey: keyById.signingKey,
+            chain: keyById.chain,
+            createdAt: keyById.createdAt
+          });
         }
       }
     }
@@ -367,17 +433,42 @@ async function verifyAlchemyWebhook(req) {
     
     const addressKey = address.toLowerCase();
     
-    if (webhookMapping.has(addressKey)) {
-      const signingKey = webhookMapping.get(addressKey).signingKey;
+    let signingKey = webhookByAddress.get(addressKey)?.signingKey;
+    if (!signingKey) {
+      const keyByAddress = await WebhookKeyModel.findOne({ address: addressKey }).lean();
+      if (keyByAddress?.signingKey) {
+        signingKey = keyByAddress.signingKey;
+        webhookByAddress.set(addressKey, {
+          webhookId: keyByAddress.webhookId,
+          signingKey: keyByAddress.signingKey,
+          chain: keyByAddress.chain,
+          createdAt: keyByAddress.createdAt
+        });
+        if (keyByAddress.webhookId) {
+          webhookById.set(keyByAddress.webhookId, {
+            address: addressKey,
+            signingKey: keyByAddress.signingKey,
+            chain: keyByAddress.chain,
+            createdAt: keyByAddress.createdAt
+          });
+        }
+      }
+    }
+    
+    if (signingKey) {
       
       const expectedSignature = crypto
         .createHmac('sha256', signingKey)
         .update(req.rawBody || JSON.stringify(req.body))
         .digest('hex');
-        
+
+      if (signature.length !== expectedSignature.length) {
+        return false;
+      }
+      
       return crypto.timingSafeEqual(
-        Buffer.from(signature),
-        Buffer.from(expectedSignature)
+        Buffer.from(signature, 'utf8'),
+        Buffer.from(expectedSignature, 'utf8')
       );
     }
     
@@ -555,12 +646,32 @@ async function createAlchemyWebhook(chain, address) {
       const webhookId = createResponse.data.data.id;
       const signingKey = createResponse.data.data.signing_key;
       
-      webhookMapping.set(address.toLowerCase(), {
+      const addressKey = address.toLowerCase();
+      webhookByAddress.set(addressKey, {
         webhookId,
         signingKey,
         chain,
         createdAt: new Date()
       });
+      webhookById.set(webhookId, {
+        address: addressKey,
+        signingKey,
+        chain,
+        createdAt: new Date()
+      });
+      
+      await WebhookKeyModel.updateOne(
+        { address: addressKey, chain },
+        {
+          $set: {
+            webhookId,
+            signingKey,
+            chain,
+            address: addressKey
+          }
+        },
+        { upsert: true }
+      );
       
       console.log(`   Webhook ID: ${webhookId}`);
       console.log(`   Signing Key stored for verification`);
@@ -571,6 +682,202 @@ async function createAlchemyWebhook(chain, address) {
   }
 }
 
+async function reconcileAlchemyWebhooks({ limit = 100, dryRun = false } = {}) {
+  await connectDB();
+
+  const alchemyChains = Object.entries(CONFIG.CHAINS)
+    .filter(([, cfg]) => cfg.webhookProvider === 'alchemy')
+    .map(([chain]) => chain);
+
+  if (alchemyChains.length === 0) {
+    return { checked: 0, created: 0, skipped: 0, dryRun, reason: 'No alchemy chains configured' };
+  }
+
+  const pendingTargets = await UserModel.aggregate([
+    { $unwind: '$integrations' },
+    { $unwind: '$integrations.pendingTrackings' },
+    {
+      $match: {
+        'integrations.pendingTrackings.status': 'pending',
+        'integrations.pendingTrackings.blockchain': { $in: alchemyChains }
+      }
+    },
+    {
+      $group: {
+        _id: {
+          address: { $toLower: '$integrations.pendingTrackings.recipientAddress' },
+          chain: '$integrations.pendingTrackings.blockchain'
+        }
+      }
+    },
+    { $limit: Math.max(1, limit) }
+  ]);
+
+  let created = 0;
+  let skipped = 0;
+
+  for (const target of pendingTargets) {
+    const address = target._id.address;
+    const chain = target._id.chain;
+
+    const inMemory = webhookByAddress.get(address);
+    if (inMemory?.signingKey) {
+      skipped += 1;
+      continue;
+    }
+
+    const inDb = await WebhookKeyModel.findOne({ address, chain }).lean();
+    if (inDb?.signingKey) {
+      webhookByAddress.set(address, {
+        webhookId: inDb.webhookId,
+        signingKey: inDb.signingKey,
+        chain: inDb.chain,
+        createdAt: inDb.createdAt
+      });
+      if (inDb.webhookId) {
+        webhookById.set(inDb.webhookId, {
+          address,
+          signingKey: inDb.signingKey,
+          chain: inDb.chain,
+          createdAt: inDb.createdAt
+        });
+      }
+      skipped += 1;
+      continue;
+    }
+
+    if (!dryRun) {
+      await createAlchemyWebhook(chain, address);
+      created += 1;
+    }
+  }
+
+  return {
+    checked: pendingTargets.length,
+    created,
+    skipped,
+    dryRun
+  };
+}
+
+async function expirePendingTrackings({ limit = 500 } = {}) {
+  await connectDB();
+
+  const now = new Date();
+  const candidates = await UserModel.aggregate([
+    { $unwind: '$integrations' },
+    { $unwind: '$integrations.pendingTrackings' },
+    {
+      $match: {
+        'integrations.pendingTrackings.status': 'pending',
+        'integrations.pendingTrackings.expiresAt': { $lt: now }
+      }
+    },
+    {
+      $project: {
+        trackingId: '$integrations.pendingTrackings.trackingId',
+        recipientAddress: '$integrations.pendingTrackings.recipientAddress'
+      }
+    },
+    { $limit: Math.max(1, limit) }
+  ]);
+
+  if (!candidates.length) {
+    return { expired: 0 };
+  }
+
+  const trackingIds = candidates.map(c => c.trackingId);
+
+  await UserModel.updateMany(
+    { 'integrations.pendingTrackings.trackingId': { $in: trackingIds } },
+    {
+      $set: {
+        'integrations.$[].pendingTrackings.$[tracking].status': 'expired',
+        'integrations.$[].pendingTrackings.$[tracking].updatedAt': now,
+        'integrations.$[].pendingTrackings.$[tracking].error': 'Expired'
+      }
+    },
+    {
+      arrayFilters: [
+        { 'tracking.trackingId': { $in: trackingIds }, 'tracking.status': 'pending' }
+      ]
+    }
+  );
+
+  for (const c of candidates) {
+    pendingTrackings.delete(c.trackingId);
+    const addressKey = c.recipientAddress?.toLowerCase();
+    if (!addressKey) continue;
+    if (addressToTrackings.has(addressKey)) {
+      const list = addressToTrackings.get(addressKey).filter(id => id !== c.trackingId);
+      if (list.length) {
+        addressToTrackings.set(addressKey, list);
+      } else {
+        addressToTrackings.delete(addressKey);
+      }
+    }
+  }
+
+  return { expired: candidates.length };
+}
+
+let reconcileIntervalId = null;
+function startAlchemyReconcileLoop() {
+  if (!CONFIG.ALCHEMY_RECONCILE_ENABLED) {
+    return;
+  }
+  if (reconcileIntervalId) {
+    return;
+  }
+  const intervalMs = Math.max(60_000, CONFIG.ALCHEMY_RECONCILE_INTERVAL_MS);
+  const limit = Math.max(1, CONFIG.ALCHEMY_RECONCILE_LIMIT);
+
+  const runOnce = async () => {
+    try {
+      const summary = await reconcileAlchemyWebhooks({ limit, dryRun: false });
+      console.log(`🔁 Reconcile summary: checked=${summary.checked} created=${summary.created} skipped=${summary.skipped}`);
+    } catch (error) {
+      console.error('❌ Reconcile loop error:', error.message);
+    }
+  };
+
+  // initial run with small jitter to avoid thundering herd
+  const jitter = Math.floor(Math.random() * 10_000);
+  setTimeout(runOnce, jitter);
+
+  reconcileIntervalId = setInterval(runOnce, intervalMs);
+  console.log(`🧭 Reconcile loop enabled (interval ${Math.round(intervalMs / 1000)}s, limit ${limit})`);
+}
+
+let cleanupIntervalId = null;
+function startPendingCleanupLoop() {
+  if (!CONFIG.PENDING_CLEANUP_ENABLED) {
+    return;
+  }
+  if (cleanupIntervalId) {
+    return;
+  }
+  const intervalMs = Math.max(60_000, CONFIG.PENDING_CLEANUP_INTERVAL_MS);
+  const limit = Math.max(1, CONFIG.PENDING_CLEANUP_LIMIT);
+
+  const runOnce = async () => {
+    try {
+      const summary = await expirePendingTrackings({ limit });
+      if (summary.expired > 0) {
+        console.log(`🧹 Expired pending trackings: ${summary.expired}`);
+      }
+    } catch (error) {
+      console.error('❌ Pending cleanup error:', error.message);
+    }
+  };
+
+  const jitter = Math.floor(Math.random() * 10_000);
+  setTimeout(runOnce, jitter);
+
+  cleanupIntervalId = setInterval(runOnce, intervalMs);
+  console.log(`🧹 Pending cleanup enabled (interval ${Math.round(intervalMs / 1000)}s, limit ${limit})`);
+}
+
 // ==================== TRANSACTION PROCESSING ====================
 
 async function processTransaction(transaction, apiKey, trackingId) {
@@ -578,6 +885,26 @@ async function processTransaction(transaction, apiKey, trackingId) {
   session.startTransaction();
 
   try {
+    // Global idempotency guard (survives restarts)
+    try {
+      await ProcessedHashModel.create(
+        [{
+          hash: transaction.hash,
+          chain: transaction.chain
+        }],
+        { session }
+      );
+    } catch (err) {
+      // Duplicate key means we've already processed this tx
+      if (err && err.code === 11000) {
+        await session.abortTransaction();
+        session.endSession();
+        console.log(`⏭️ Skipping already-processed tx: ${transaction.hash} on ${transaction.chain}`);
+        return false;
+      }
+      throw err;
+    }
+
     processedHashes.add(transaction.hash);
 
     const tracking = pendingTrackings.get(trackingId);
@@ -1198,7 +1525,7 @@ async function healthCheck(req, res) {
         processedHashes: processedHashes.size,
         activeTrackings: pendingTrackings.size,
         addressesMonitored: addressToTrackings.size,
-        webhooksConfigured: webhookMapping.size,
+        webhooksConfigured: webhookByAddress.size,
         pendingTransactions: pendingCount[0]?.total || 0,
         completedTransactions: completedCount[0]?.total || 0
       }
@@ -1218,6 +1545,9 @@ module.exports = {
   initialize: async () => {
     await connectDB();
     await enableTatumHmac();
+    await loadWebhookKeysIntoMemory();
+    startAlchemyReconcileLoop();
+    startPendingCleanupLoop();
     // Log ALCHEMY_AUTH_TOKEN for debugging (mask all but last 4 chars)
     const token = CONFIG.ALCHEMY_AUTH_TOKEN;
     if (token) {
@@ -1241,6 +1571,7 @@ module.exports = {
   tatumWebhook: handleTatumWebhook,
   getUserTransactions,
   healthCheck,
+  reconcileAlchemyWebhooks,
   
   CONFIG
 };

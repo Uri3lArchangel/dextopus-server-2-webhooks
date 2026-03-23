@@ -214,6 +214,25 @@ app.post('/api/tatum-webhook', async (req, res) => {
 });
 
 /**
+ * ADMIN: Reconcile Alchemy webhooks for pending addresses
+ * POST /api/admin/reconcile-webhooks
+ * Body: { limit?: number, dryRun?: boolean }
+ */
+app.post('/api/admin/reconcile-webhooks', authenticateServer1, async (req, res) => {
+  try {
+    const { limit, dryRun } = req.body || {};
+    const summary = await txListener.reconcileAlchemyWebhooks({
+      limit: typeof limit === 'number' ? limit : 100,
+      dryRun: !!dryRun
+    });
+    res.status(200).json({ success: true, summary });
+  } catch (error) {
+    console.error('❌ Reconcile webhooks error:', error);
+    res.status(500).json({ error: 'Reconcile failed', details: error.message });
+  }
+});
+
+/**
  * ENDPOINT 4: Dashboard fetches user transactions
  * GET /api/transactions/:apiKey
  */
