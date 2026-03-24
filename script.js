@@ -10,6 +10,7 @@ dotenv.config();
 const { TOKENS, NATIVE_TOKEN_ADDRESS } = require('./tokens.js');
 const WebhookKeyModel = require('./models/WebhookKey.js');
 const ProcessedHashModel = require('./models/ProcessedHash.js');
+const AlchemyWebhookModel = require('./models/AlchemyWebhook.js');
 
 // ==================== CHAIN EXPLORERS ====================
 const CHAIN_EXPLORERS = {
@@ -46,6 +47,7 @@ const CONFIG = {
   ALCHEMY_RECONCILE_ENABLED: process.env.ALCHEMY_RECONCILE_ENABLED === 'true',
   ALCHEMY_RECONCILE_INTERVAL_MS: Number(process.env.ALCHEMY_RECONCILE_INTERVAL_MS || 15 * 60 * 1000),
   ALCHEMY_RECONCILE_LIMIT: Number(process.env.ALCHEMY_RECONCILE_LIMIT || 100),
+  ALCHEMY_WEBHOOK_PRUNE_ENABLED: process.env.ALCHEMY_WEBHOOK_PRUNE_ENABLED === 'true',
   PENDING_CLEANUP_ENABLED: process.env.PENDING_CLEANUP_ENABLED !== 'false',
   PENDING_CLEANUP_INTERVAL_MS: Number(process.env.PENDING_CLEANUP_INTERVAL_MS || 10 * 60 * 1000),
   PENDING_CLEANUP_LIMIT: Number(process.env.PENDING_CLEANUP_LIMIT || 500),
@@ -265,6 +267,26 @@ const CONFIG = {
   }
 };
 
+const ALCHEMY_NETWORK_MAP = {
+  ethereum: 'ETH_MAINNET',
+  polygon: 'MATIC_MAINNET',
+  arbitrum: 'ARB_MAINNET',
+  optimism: 'OPT_MAINNET',
+  base: 'BASE_MAINNET',
+  bsc: 'BNB_MAINNET',
+  avalanche: 'AVAX_MAINNET',
+  mantle: 'MANTLE_MAINNET',
+  cronos: 'CRONOS_MAINNET',
+  gnosis: 'GNOSIS_MAINNET',
+  flare: 'FLARE_MAINNET',
+  ink: 'INK_MAINNET',
+  unichain: 'UNICHAIN_MAINNET',
+  bera: 'BERA_MAINNET',
+  plasma: 'PLASMA_MAINNET',
+  monad: 'MONAD_MAINNET',
+  katana: 'KATANA_MAINNET'
+};
+
 // Import User model
 const UserModel = require('./models/User.js');
 
@@ -274,6 +296,7 @@ const pendingTrackings = new Map();
 const addressToTrackings = new Map();
 const webhookByAddress = new Map();
 const webhookById = new Map();
+const alchemyWebhookByChain = new Map();
 
 // Helper function to find token
 function findToken(chain, address, symbol) {
@@ -310,6 +333,36 @@ function isValidWebhookUrl(url) {
   } catch {
     return false;
   }
+}
+
+function getAlchemyAuthTokens() {
+  const tokens = [];
+  const multi = process.env.ALCHEMY_AUTH_TOKENS;
+  if (multi) {
+    for (const part of multi.split(',')) {
+      const t = part.trim();
+      if (t) tokens.push(t);
+    }
+  }
+  if (tokens.length === 0 && CONFIG.ALCHEMY_AUTH_TOKEN) {
+    tokens.push(CONFIG.ALCHEMY_AUTH_TOKEN);
+  }
+  return tokens;
+}
+
+function pickTokenIndexForChain(chain, tokenCount) {
+  if (!tokenCount) return 0;
+  let sum = 0;
+  for (let i = 0; i < chain.length; i += 1) {
+    sum += chain.charCodeAt(i);
+  }
+  return sum % tokenCount;
+}
+
+function getWebhookUrl() {
+  let baseUrl = CONFIG.SERVER2_URL;
+  if (baseUrl.endsWith('/')) baseUrl = baseUrl.slice(0, -1);
+  return `${baseUrl}/api/alchemy-webhook`;
 }
 
 function getExplorerUrl(chain, hash) {
@@ -373,6 +426,25 @@ async function loadWebhookKeysIntoMemory() {
   console.log(`🔐 Loaded ${keys.length} webhook signing keys`);
 }
 
+async function loadAlchemyWebhooksIntoMemory() {
+  await connectDB();
+  const hooks = await AlchemyWebhookModel.find({}).lean();
+  for (const hook of hooks) {
+    alchemyWebhookByChain.set(hook.chain, hook);
+    if (hook.webhookId) {
+      webhookById.set(hook.webhookId, {
+        address: null,
+        signingKey: hook.signingKey,
+        chain: hook.chain,
+        createdAt: hook.createdAt
+      });
+    }
+  }
+  if (hooks.length) {
+    console.log(`🔗 Loaded ${hooks.length} Alchemy webhooks`);
+  }
+}
+
 async function verifyAlchemyWebhook(req) {
   const signature = normalizeAlchemySignature(req.headers['x-alchemy-signature']);
   if (!signature) {
@@ -426,34 +498,55 @@ async function verifyAlchemyWebhook(req) {
       }
     }
     
-    if (!address) {
-      console.log('⚠️ Could not extract address from webhook payload');
-      return false;
-    }
-    
-    const addressKey = address.toLowerCase();
-    
-    let signingKey = webhookByAddress.get(addressKey)?.signingKey;
-    if (!signingKey) {
-      const keyByAddress = await WebhookKeyModel.findOne({ address: addressKey }).lean();
-      if (keyByAddress?.signingKey) {
-        signingKey = keyByAddress.signingKey;
-        webhookByAddress.set(addressKey, {
-          webhookId: keyByAddress.webhookId,
-          signingKey: keyByAddress.signingKey,
-          chain: keyByAddress.chain,
-          createdAt: keyByAddress.createdAt
-        });
-        if (keyByAddress.webhookId) {
-          webhookById.set(keyByAddress.webhookId, {
-            address: addressKey,
-            signingKey: keyByAddress.signingKey,
-            chain: keyByAddress.chain,
-            createdAt: keyByAddress.createdAt
+    let signingKey = null;
+
+    if (webhookId) {
+      signingKey = webhookById.get(webhookId)?.signingKey;
+      if (!signingKey) {
+        const hook = await AlchemyWebhookModel.findOne({ webhookId }).lean();
+        if (hook?.signingKey) {
+          signingKey = hook.signingKey;
+          webhookById.set(webhookId, {
+            address: null,
+            signingKey: hook.signingKey,
+            chain: hook.chain,
+            createdAt: hook.createdAt
           });
         }
       }
     }
+
+    if (!signingKey && address) {
+      const addressKey = address.toLowerCase();
+      signingKey = webhookByAddress.get(addressKey)?.signingKey;
+      if (!signingKey) {
+        const keyByAddress = await WebhookKeyModel.findOne({ address: addressKey }).lean();
+        if (keyByAddress?.signingKey) {
+          signingKey = keyByAddress.signingKey;
+          webhookByAddress.set(addressKey, {
+            webhookId: keyByAddress.webhookId,
+            signingKey: keyByAddress.signingKey,
+            chain: keyByAddress.chain,
+            createdAt: keyByAddress.createdAt
+          });
+          if (keyByAddress.webhookId) {
+            webhookById.set(keyByAddress.webhookId, {
+              address: addressKey,
+              signingKey: keyByAddress.signingKey,
+              chain: keyByAddress.chain,
+              createdAt: keyByAddress.createdAt
+            });
+          }
+        }
+      }
+    }
+
+    if (!signingKey) {
+      console.log('⚠️ Could not extract signing key from webhook payload');
+      return false;
+    }
+    
+    const addressKey = address ? address.toLowerCase() : 'unknown';
     
     if (signingKey) {
       
@@ -497,22 +590,44 @@ function verifyTatumWebhook(req) {
 }
 
 let cachedDb = null;
+let connectPromise = null;
 
 async function connectDB() {
-  if (cachedDb && mongoose.connection.readyState === 1) {
+  if (mongoose.connection.readyState === 1) {
+    if (!cachedDb) cachedDb = mongoose;
     return cachedDb;
   }
-  
+
+  if (mongoose.connection.readyState === 2) {
+    if (!connectPromise) {
+      const waitForConnect = typeof mongoose.connection.asPromise === 'function'
+        ? mongoose.connection.asPromise()
+        : new Promise((resolve, reject) => {
+            mongoose.connection.once('connected', () => resolve(mongoose));
+            mongoose.connection.once('error', reject);
+          });
+      connectPromise = waitForConnect.then((conn) => {
+        cachedDb = conn;
+        return conn;
+      });
+    }
+    return connectPromise;
+  }
+
   mongoose.set('bufferCommands', false);
-  
-  const conn = await mongoose.connect(CONFIG.MONGODB_URI, {
+
+  connectPromise = mongoose.connect(CONFIG.MONGODB_URI, {
     maxPoolSize: 5,
     serverSelectionTimeoutMS: 5000,
     socketTimeoutMS: 45000,
+  }).then((conn) => {
+    cachedDb = conn;
+    return conn;
+  }).finally(() => {
+    connectPromise = null;
   });
-  
-  cachedDb = conn;
-  return conn;
+
+  return connectPromise;
 }
 
 // ==================== WEBHOOK SETUP ====================
@@ -582,70 +697,65 @@ async function createTatumWebhook(address) {
 }
 
 async function createAlchemyWebhook(chain, address) {
-  if (!CONFIG.ALCHEMY_AUTH_TOKEN) {
-    console.log(`⚠️ Alchemy Auth Token not configured.`);
-    return;
-  }
-
   try {
-    // Ensure no double slash in webhook URL
-    let baseUrl = CONFIG.SERVER2_URL;
-    if (baseUrl.endsWith('/')) baseUrl = baseUrl.slice(0, -1);
-    const webhookUrl = `${baseUrl}/api/alchemy-webhook`;
-    console.log({webhookUrl});
+    const tokens = getAlchemyAuthTokens();
+    if (!tokens.length) {
+      console.log(`⚠️ Alchemy Auth Token not configured.`);
+      return null;
+    }
+
+    const webhookUrl = getWebhookUrl();
+    console.log({ webhookUrl });
     if (!isValidWebhookUrl(webhookUrl)) {
       console.error(`❌ Invalid webhook URL: ${webhookUrl}`);
-      return;
-    }
-    
-    const networkMap = {
-      ethereum: 'ETH_MAINNET',
-      polygon: 'MATIC_MAINNET',
-      arbitrum: 'ARB_MAINNET',
-      optimism: 'OPT_MAINNET',
-      base: 'BASE_MAINNET',
-      bsc: 'BNB_MAINNET',
-      avalanche: 'AVAX_MAINNET',
-      mantle: 'MANTLE_MAINNET',
-      cronos: 'CRONOS_MAINNET',
-      gnosis: 'GNOSIS_MAINNET',
-      flare: 'FLARE_MAINNET',
-      ink: 'INK_MAINNET',
-      unichain: 'UNICHAIN_MAINNET',
-      bera: 'BERA_MAINNET',
-      plasma: 'PLASMA_MAINNET',
-      monad: 'MONAD_MAINNET',
-      katana: 'KATANA_MAINNET'
-    };
-    
-    const network = networkMap[chain];
-    if (!network) {
-      console.error(`❌ Unsupported chain for Alchemy webhooks: ${chain}`);
-      return;
+      return null;
     }
 
-    const createResponse = await axios.post(
-      'https://dashboard.alchemy.com/api/create-webhook',
-      {
-        network: network,
-        webhook_type: 'ADDRESS_ACTIVITY',
-        webhook_url: webhookUrl,
-        addresses: [address]
-      },
-      {
-        headers: {
-          'X-Alchemy-Token': CONFIG.ALCHEMY_AUTH_TOKEN,
-          'Content-Type': 'application/json'
-        }
+    const network = ALCHEMY_NETWORK_MAP[chain];
+    if (!network) {
+      console.error(`❌ Unsupported chain for Alchemy webhooks: ${chain}`);
+      return null;
+    }
+
+    let createResponse = null;
+    let tokenIndex = 0;
+    let lastError = null;
+    const startIndex = pickTokenIndexForChain(chain, tokens.length);
+    for (let i = 0; i < tokens.length; i += 1) {
+      try {
+        tokenIndex = (startIndex + i) % tokens.length;
+        createResponse = await axios.post(
+          'https://dashboard.alchemy.com/api/create-webhook',
+          {
+            network: network,
+            webhook_type: 'ADDRESS_ACTIVITY',
+            webhook_url: webhookUrl,
+            addresses: [address]
+          },
+          {
+            headers: {
+              'X-Alchemy-Token': tokens[tokenIndex],
+              'Content-Type': 'application/json'
+            }
+          }
+        );
+        lastError = null;
+        break;
+      } catch (err) {
+        lastError = err;
       }
-    );
-    
+    }
+
+    if (!createResponse) {
+      throw lastError || new Error('Failed to create webhook');
+    }
+
     console.log(`✅ Created Alchemy webhook for ${chain}: ${address}`);
-    
+
     if (createResponse.data?.data?.id) {
       const webhookId = createResponse.data.data.id;
       const signingKey = createResponse.data.data.signing_key;
-      
+
       const addressKey = address.toLowerCase();
       webhookByAddress.set(addressKey, {
         webhookId,
@@ -659,7 +769,7 @@ async function createAlchemyWebhook(chain, address) {
         chain,
         createdAt: new Date()
       });
-      
+
       await WebhookKeyModel.updateOne(
         { address: addressKey, chain },
         {
@@ -672,14 +782,222 @@ async function createAlchemyWebhook(chain, address) {
         },
         { upsert: true }
       );
-      
+
+      await AlchemyWebhookModel.updateOne(
+        { chain },
+        {
+          $set: {
+            chain,
+            network,
+            webhookId,
+            signingKey,
+            webhookUrl,
+            tokenIndex
+          }
+        },
+        { upsert: true }
+      );
+
+      const hook = {
+        chain,
+        network,
+        webhookId,
+        signingKey,
+        webhookUrl,
+        tokenIndex
+      };
+
+      alchemyWebhookByChain.set(chain, hook);
+
       console.log(`   Webhook ID: ${webhookId}`);
       console.log(`   Signing Key stored for verification`);
-    }
 
+      return hook;
+    }
   } catch (error) {
     console.error(`❌ Failed to create Alchemy webhook:`, error.response?.data || error.message);
   }
+
+  return null;
+}
+
+async function listAlchemyTeamWebhooks(token) {
+  const response = await axios.get('https://dashboard.alchemy.com/api/team-webhooks', {
+    headers: { 'X-Alchemy-Token': token }
+  });
+
+  // Response shape may vary; normalize to array
+  if (Array.isArray(response.data)) {
+    // Sometimes wrapped as [{ data: [...] }]
+    const first = response.data[0];
+    if (first && Array.isArray(first.data)) return first.data;
+    return response.data;
+  }
+  if (response.data?.data && Array.isArray(response.data.data)) {
+    return response.data.data;
+  }
+  return [];
+}
+
+async function ensureAlchemyWebhook(chain, addressForCreate) {
+  const cached = alchemyWebhookByChain.get(chain);
+  if (cached?.webhookId && cached?.signingKey) {
+    return cached;
+  }
+
+  const fromDb = await AlchemyWebhookModel.findOne({ chain }).lean();
+  if (fromDb?.webhookId && fromDb?.signingKey) {
+    alchemyWebhookByChain.set(chain, fromDb);
+    webhookById.set(fromDb.webhookId, {
+      address: null,
+      signingKey: fromDb.signingKey,
+      chain: fromDb.chain,
+      createdAt: fromDb.createdAt
+    });
+    return fromDb;
+  }
+
+  const tokens = getAlchemyAuthTokens();
+  const webhookUrl = getWebhookUrl();
+  const network = ALCHEMY_NETWORK_MAP[chain];
+  if (!tokens.length || !network) return null;
+
+  for (let i = 0; i < tokens.length; i += 1) {
+    try {
+      const hooks = await listAlchemyTeamWebhooks(tokens[i]);
+      const match = hooks.find(h =>
+        h.webhook_type === 'ADDRESS_ACTIVITY' &&
+        h.network === network &&
+        h.webhook_url === webhookUrl
+      );
+      if (match?.id && match?.signing_key) {
+        const hook = {
+          chain,
+          network,
+          webhookId: match.id,
+          signingKey: match.signing_key,
+          webhookUrl,
+          tokenIndex: i
+        };
+        await AlchemyWebhookModel.updateOne(
+          { chain },
+          { $set: hook },
+          { upsert: true }
+        );
+        alchemyWebhookByChain.set(chain, hook);
+        webhookById.set(match.id, {
+          address: null,
+          signingKey: match.signing_key,
+          chain,
+          createdAt: new Date()
+        });
+        return hook;
+      }
+    } catch (error) {
+      continue;
+    }
+  }
+
+  if (addressForCreate) {
+    return await createAlchemyWebhook(chain, addressForCreate);
+  }
+
+  return null;
+}
+
+async function updateAlchemyWebhookAddresses(hook, addressesToAdd, addressesToRemove) {
+  if (!hook?.webhookId) return;
+  const tokens = getAlchemyAuthTokens();
+  if (!tokens.length) return;
+
+  const token = tokens[Math.min(hook.tokenIndex || 0, tokens.length - 1)];
+  const chunkSize = 100;
+
+  const addChunks = [];
+  for (let i = 0; i < (addressesToAdd || []).length; i += chunkSize) {
+    addChunks.push(addressesToAdd.slice(i, i + chunkSize));
+  }
+  const removeChunks = [];
+  for (let i = 0; i < (addressesToRemove || []).length; i += chunkSize) {
+    removeChunks.push(addressesToRemove.slice(i, i + chunkSize));
+  }
+
+  const maxChunks = Math.max(addChunks.length, removeChunks.length, 1);
+  for (let i = 0; i < maxChunks; i += 1) {
+    const add = addChunks[i] || [];
+    const remove = removeChunks[i] || [];
+    if (!add.length && !remove.length) continue;
+
+    await axios.patch(
+      'https://dashboard.alchemy.com/api/update-webhook-addresses',
+      {
+        webhook_id: hook.webhookId,
+        addresses_to_add: add,
+        addresses_to_remove: remove
+      },
+      {
+        headers: {
+          'X-Alchemy-Token': token,
+          'Content-Type': 'application/json'
+        }
+      }
+    );
+  }
+}
+
+async function deleteAlchemyWebhook(token, webhookId) {
+  await axios.delete('https://dashboard.alchemy.com/api/delete-webhook', {
+    data: { webhook_id: webhookId },
+    headers: {
+      'X-Alchemy-Token': token,
+      'Content-Type': 'application/json'
+    }
+  });
+}
+
+async function pruneAlchemyWebhooks() {
+  if (!CONFIG.ALCHEMY_WEBHOOK_PRUNE_ENABLED) return { pruned: 0 };
+
+  const tokens = getAlchemyAuthTokens();
+  if (!tokens.length) return { pruned: 0 };
+
+  const webhookUrl = getWebhookUrl();
+  const allowedNetworks = new Set(Object.values(ALCHEMY_NETWORK_MAP));
+
+  let pruned = 0;
+
+  for (let i = 0; i < tokens.length; i += 1) {
+    const hooks = await listAlchemyTeamWebhooks(tokens[i]);
+    for (const hook of hooks) {
+      if (
+        hook.webhook_type !== 'ADDRESS_ACTIVITY' ||
+        hook.webhook_url !== webhookUrl ||
+        !allowedNetworks.has(hook.network)
+      ) {
+        continue;
+      }
+
+      const chain = Object.keys(ALCHEMY_NETWORK_MAP).find(
+        key => ALCHEMY_NETWORK_MAP[key] === hook.network
+      );
+      const primary = chain ? alchemyWebhookByChain.get(chain) : null;
+
+      const isPrimary = primary && primary.webhookId === hook.id;
+      const hasAddresses = Array.isArray(hook.addresses) && hook.addresses.length > 0;
+      const inactive = hook.is_active === false;
+
+      if (!isPrimary && (inactive || !hasAddresses)) {
+        try {
+          await deleteAlchemyWebhook(tokens[i], hook.id);
+          pruned += 1;
+        } catch (error) {
+          continue;
+        }
+      }
+    }
+  }
+
+  return { pruned };
 }
 
 async function reconcileAlchemyWebhooks({ limit = 100, dryRun = false } = {}) {
@@ -716,39 +1034,26 @@ async function reconcileAlchemyWebhooks({ limit = 100, dryRun = false } = {}) {
   let created = 0;
   let skipped = 0;
 
+  const byChain = new Map();
   for (const target of pendingTargets) {
     const address = target._id.address;
     const chain = target._id.chain;
+    if (!byChain.has(chain)) byChain.set(chain, new Set());
+    byChain.get(chain).add(address);
+  }
 
-    const inMemory = webhookByAddress.get(address);
-    if (inMemory?.signingKey) {
-      skipped += 1;
+  for (const [chain, addressSet] of byChain.entries()) {
+    const addresses = Array.from(addressSet);
+    const hook = await ensureAlchemyWebhook(chain, addresses[0]);
+    if (!hook) {
+      skipped += addresses.length;
       continue;
     }
-
-    const inDb = await WebhookKeyModel.findOne({ address, chain }).lean();
-    if (inDb?.signingKey) {
-      webhookByAddress.set(address, {
-        webhookId: inDb.webhookId,
-        signingKey: inDb.signingKey,
-        chain: inDb.chain,
-        createdAt: inDb.createdAt
-      });
-      if (inDb.webhookId) {
-        webhookById.set(inDb.webhookId, {
-          address,
-          signingKey: inDb.signingKey,
-          chain: inDb.chain,
-          createdAt: inDb.createdAt
-        });
-      }
-      skipped += 1;
-      continue;
-    }
-
     if (!dryRun) {
-      await createAlchemyWebhook(chain, address);
-      created += 1;
+      await updateAlchemyWebhookAddresses(hook, addresses, []);
+      created += addresses.length;
+    } else {
+      skipped += addresses.length;
     }
   }
 
@@ -776,7 +1081,8 @@ async function expirePendingTrackings({ limit = 500 } = {}) {
     {
       $project: {
         trackingId: '$integrations.pendingTrackings.trackingId',
-        recipientAddress: '$integrations.pendingTrackings.recipientAddress'
+        recipientAddress: '$integrations.pendingTrackings.recipientAddress',
+        blockchain: '$integrations.pendingTrackings.blockchain'
       }
     },
     { $limit: Math.max(1, limit) }
@@ -804,6 +1110,8 @@ async function expirePendingTrackings({ limit = 500 } = {}) {
     }
   );
 
+  const removeByChain = new Map();
+
   for (const c of candidates) {
     pendingTrackings.delete(c.trackingId);
     const addressKey = c.recipientAddress?.toLowerCase();
@@ -814,6 +1122,38 @@ async function expirePendingTrackings({ limit = 500 } = {}) {
         addressToTrackings.set(addressKey, list);
       } else {
         addressToTrackings.delete(addressKey);
+      }
+    }
+
+    const chain = c.blockchain;
+    if (chain) {
+      if (!removeByChain.has(chain)) removeByChain.set(chain, new Set());
+      removeByChain.get(chain).add(addressKey);
+    }
+  }
+
+  // Remove addresses from Alchemy webhook if no pending trackings remain
+  for (const [chain, addressSet] of removeByChain.entries()) {
+    const addresses = Array.from(addressSet);
+    const toRemove = [];
+    for (const address of addresses) {
+      const still = await UserModel.findOne({
+        'integrations.pendingTrackings': {
+          $elemMatch: {
+            recipientAddress: { $regex: new RegExp(`^${address}$`, 'i') },
+            blockchain: chain,
+            status: 'pending'
+          }
+        }
+      }).lean();
+      if (!still) {
+        toRemove.push(address);
+      }
+    }
+    if (toRemove.length && CONFIG.CHAINS[chain]?.webhookProvider === 'alchemy') {
+      const hook = await ensureAlchemyWebhook(chain, toRemove[0]);
+      if (hook) {
+        await updateAlchemyWebhookAddresses(hook, [], toRemove);
       }
     }
   }
@@ -836,6 +1176,12 @@ function startAlchemyReconcileLoop() {
     try {
       const summary = await reconcileAlchemyWebhooks({ limit, dryRun: false });
       console.log(`🔁 Reconcile summary: checked=${summary.checked} created=${summary.created} skipped=${summary.skipped}`);
+      if (CONFIG.ALCHEMY_WEBHOOK_PRUNE_ENABLED) {
+        const pruneSummary = await pruneAlchemyWebhooks();
+        if (pruneSummary.pruned > 0) {
+          console.log(`🧹 Pruned Alchemy webhooks: ${pruneSummary.pruned}`);
+        }
+      }
     } catch (error) {
       console.error('❌ Reconcile loop error:', error.message);
     }
@@ -1110,7 +1456,9 @@ async function trackTransaction(apiKey, txData) {
       if (CONFIG.CHAINS[blockchain].webhookProvider === 'tatum') {
         createTatumWebhook(recipientAddress).catch(console.error);
       } else if (CONFIG.CHAINS[blockchain].webhookProvider === 'alchemy') {
-        createAlchemyWebhook(blockchain, recipientAddress).catch(console.error);
+        ensureAlchemyWebhook(blockchain, recipientAddress)
+          .then(hook => hook && updateAlchemyWebhookAddresses(hook, [recipientAddress], []))
+          .catch(console.error);
       }
     }
 
@@ -1525,7 +1873,7 @@ async function healthCheck(req, res) {
         processedHashes: processedHashes.size,
         activeTrackings: pendingTrackings.size,
         addressesMonitored: addressToTrackings.size,
-        webhooksConfigured: webhookByAddress.size,
+        webhooksConfigured: alchemyWebhookByChain.size,
         pendingTransactions: pendingCount[0]?.total || 0,
         completedTransactions: completedCount[0]?.total || 0
       }
@@ -1546,13 +1894,14 @@ module.exports = {
     await connectDB();
     await enableTatumHmac();
     await loadWebhookKeysIntoMemory();
+    await loadAlchemyWebhooksIntoMemory();
     startAlchemyReconcileLoop();
     startPendingCleanupLoop();
     // Log ALCHEMY_AUTH_TOKEN for debugging (mask all but last 4 chars)
-    const token = CONFIG.ALCHEMY_AUTH_TOKEN;
-    if (token) {
-      const masked = token.length > 8 ? token.slice(0, 4) + '...' + token.slice(-4) : token;
-      console.log(`🔑 ALCHEMY_AUTH_TOKEN loaded: ${masked}`);
+    const tokens = getAlchemyAuthTokens();
+    if (tokens.length) {
+      const masked = tokens.map(t => (t.length > 8 ? t.slice(0, 4) + '...' + t.slice(-4) : t));
+      console.log(`🔑 ALCHEMY_AUTH_TOKEN loaded: ${masked.join(', ')}`);
     } else {
       console.warn('⚠️  ALCHEMY_AUTH_TOKEN is NOT set!');
     }
