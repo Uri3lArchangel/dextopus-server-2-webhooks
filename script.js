@@ -374,6 +374,12 @@ function isAlchemyWebhookLimitError(error) {
   return typeof msg === 'string' && msg.toLowerCase().includes('too many webhooks');
 }
 
+function isAlchemyWebhookNotFoundError(error) {
+  const status = error?.response?.status;
+  const msg = error?.response?.data?.message || error?.message || '';
+  return status === 404 && typeof msg === 'string' && msg.toLowerCase().includes('webhook not found');
+}
+
 function pickTokenIndexForChain(chain, tokenCount) {
   if (!tokenCount) return 0;
   let sum = 0;
@@ -946,22 +952,24 @@ async function listAlchemyTeamWebhooks(token) {
   return [];
 }
 
-async function ensureAlchemyWebhook(chain, addressForCreate) {
-  const cached = alchemyWebhookByChain.get(chain);
-  if (cached?.webhookId && cached?.signingKey) {
-    return cached;
-  }
+async function ensureAlchemyWebhook(chain, addressForCreate, { forceRefresh = false } = {}) {
+  if (!forceRefresh) {
+    const cached = alchemyWebhookByChain.get(chain);
+    if (cached?.webhookId && cached?.signingKey) {
+      return cached;
+    }
 
-  const fromDb = await AlchemyWebhookModel.findOne({ chain }).lean();
-  if (fromDb?.webhookId && fromDb?.signingKey) {
-    alchemyWebhookByChain.set(chain, fromDb);
-    webhookById.set(fromDb.webhookId, {
-      address: null,
-      signingKey: fromDb.signingKey,
-      chain: fromDb.chain,
-      createdAt: fromDb.createdAt
-    });
-    return fromDb;
+    const fromDb = await AlchemyWebhookModel.findOne({ chain }).lean();
+    if (fromDb?.webhookId && fromDb?.signingKey) {
+      alchemyWebhookByChain.set(chain, fromDb);
+      webhookById.set(fromDb.webhookId, {
+        address: null,
+        signingKey: fromDb.signingKey,
+        chain: fromDb.chain,
+        createdAt: fromDb.createdAt
+      });
+      return fromDb;
+    }
   }
 
   const tokens = getAlchemyAuthTokens();
@@ -1019,7 +1027,6 @@ async function updateAlchemyWebhookAddresses(hook, addressesToAdd, addressesToRe
   const tokens = getAlchemyAuthTokens();
   if (!tokens.length) return;
 
-  const token = tokens[Math.min(hook.tokenIndex || 0, tokens.length - 1)];
   const chunkSize = 100;
 
   const addChunks = [];
@@ -1032,15 +1039,14 @@ async function updateAlchemyWebhookAddresses(hook, addressesToAdd, addressesToRe
   }
 
   const maxChunks = Math.max(addChunks.length, removeChunks.length, 1);
-  for (let i = 0; i < maxChunks; i += 1) {
-    const add = addChunks[i] || [];
-    const remove = removeChunks[i] || [];
-    if (!add.length && !remove.length) continue;
+  let currentHook = hook;
 
-    await axios.patch(
+  const patchWithHook = async (targetHook, add, remove) => {
+    const token = tokens[Math.min(targetHook.tokenIndex || 0, tokens.length - 1)];
+    return axios.patch(
       'https://dashboard.alchemy.com/api/update-webhook-addresses',
       {
-        webhook_id: hook.webhookId,
+        webhook_id: targetHook.webhookId,
         addresses_to_add: add,
         addresses_to_remove: remove
       },
@@ -1051,6 +1057,30 @@ async function updateAlchemyWebhookAddresses(hook, addressesToAdd, addressesToRe
         }
       }
     );
+  };
+
+  for (let i = 0; i < maxChunks; i += 1) {
+    const add = addChunks[i] || [];
+    const remove = removeChunks[i] || [];
+    if (!add.length && !remove.length) continue;
+    try {
+      await patchWithHook(currentHook, add, remove);
+    } catch (error) {
+      if (isAlchemyWebhookNotFoundError(error)) {
+        const refreshAddress = add[0] || null;
+        const refreshed = await ensureAlchemyWebhook(
+          currentHook.chain,
+          refreshAddress,
+          { forceRefresh: true }
+        );
+        if (refreshed?.webhookId) {
+          currentHook = refreshed;
+          await patchWithHook(currentHook, add, remove);
+          continue;
+        }
+      }
+      throw error;
+    }
   }
 }
 
